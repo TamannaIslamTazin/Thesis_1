@@ -1,0 +1,907 @@
+// SSI Healthcare - Prisma Schema
+// Comprehensive database schema for Self-Sovereign Identity management
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// CORE IDENTITY
+// ============================================================================
+
+/// User account - represents a credential holder (patient) or institutional user
+model User {
+  id            String    @id @default(cuid())
+  did           String?   @unique // DID created after wallet setup
+  email         String    @unique
+  emailVerified DateTime?
+
+  // Profile
+  firstName   String?
+  lastName    String?
+  displayName String?
+  avatarUrl   String?
+  phone       String?
+
+  // Authentication
+  passwordHash String? // For email/password auth
+  totpSecret   String? // For 2FA
+  totpEnabled  Boolean @default(false)
+
+  // Wallet status
+  walletSetup Boolean     @default(false)
+  walletType  WalletType?
+
+  // Security settings
+  biometricEnabled Boolean @default(false)
+  autoLockMinutes  Int     @default(5)
+
+  // Timestamps
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  lastLoginAt DateTime?
+
+  // Relations
+  accounts          Account[]
+  sessions          Session[]
+  passkeys          Passkey[]
+  credentials       Credential[]
+  consentsGiven     Consent[]               @relation("HolderConsents")
+  consentsReceived  Consent[]               @relation("VerifierConsents")
+  auditLogs         AuditLog[]              @relation("ActorLogs")
+  targetLogs        AuditLog[]              @relation("TargetLogs")
+  emergencyContacts EmergencyContact[]      @relation("UserContacts")
+  emergencyAccessTo EmergencyContact[]      @relation("EmergencyContactUser")
+  webhooks          Webhook[]
+  notificationPrefs NotificationPreference?
+
+  @@index([email])
+  @@index([did])
+}
+
+enum WalletType {
+  CLOUD // Custodial cloud wallet (easier onboarding)
+  DEVICE // Device-bound keys
+  HARDWARE // Hardware security module
+  HYBRID // Cloud + device backup
+}
+
+/// OAuth accounts (Google, Apple, Microsoft)
+model Account {
+  id                String @id @default(cuid())
+  userId            String
+  type              String // "oauth" | "email" | "credentials"
+  provider          String // "google" | "apple" | "microsoft" | "email"
+  providerAccountId String
+
+  // OAuth tokens
+  accessToken  String?
+  refreshToken String?
+  expiresAt    Int?
+  tokenType    String?
+  scope        String?
+  idToken      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+/// User sessions
+model Session {
+  id     String @id @default(cuid())
+  userId String
+  token  String @unique
+
+  // Refresh token for automatic token renewal
+  refreshToken     String?   @unique
+  refreshExpiresAt DateTime?
+
+  // Session metadata
+  userAgent  String?
+  ipAddress  String?
+  deviceName String?
+
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+  lastActiveAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+  @@index([refreshToken])
+}
+
+/// WebAuthn passkeys for passwordless auth
+model Passkey {
+  id     String @id @default(cuid())
+  userId String
+
+  // WebAuthn credential data
+  credentialId String   @unique
+  publicKey    Bytes
+  counter      BigInt   @default(0)
+  transports   String[] // ["internal", "usb", "ble", "nfc"]
+
+  // Metadata
+  deviceName String?
+  lastUsedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([credentialId])
+}
+
+// ============================================================================
+// DECENTRALIZED IDENTIFIERS
+// ============================================================================
+
+/// DID document storage
+model DIDDocument {
+  id     String    @id @default(cuid())
+  did    String    @unique
+  method DIDMethod
+
+  // DID Document content
+  document Json // Full DID Document
+
+  // Key references (extracted for quick lookup)
+  verificationMethods Json? // Array of verification method IDs
+
+  // Status
+  status        DIDStatus @default(ACTIVE)
+  deactivatedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([did])
+  @@index([method])
+}
+
+enum DIDMethod {
+  KEY // did:key
+  WEB // did:web
+  CHEQD // did:cheqd
+  ION // did:ion
+  PEER // did:peer
+}
+
+enum DIDStatus {
+  ACTIVE
+  DEACTIVATED
+  REVOKED
+}
+
+// ============================================================================
+// VERIFIABLE CREDENTIALS
+// ============================================================================
+
+/// Verifiable Credential storage
+model Credential {
+  id           String  @id @default(cuid())
+  holderUserId String?
+  holderDid    String
+  issuerDid    String
+
+  // Credential metadata
+  type        String[] // ["VerifiableCredential", "HealthCredential"]
+  category    CredentialCategory
+  name        String
+  description String?
+
+  // Credential data
+  credentialData Json // The VC JSON
+  credentialHash String @unique // SHA-256 hash for integrity
+
+  // Schema reference
+  schemaId      String?
+  schemaVersion String?
+
+  // Status
+  status           CredentialStatus @default(ACTIVE)
+  issuedAt         DateTime
+  expiresAt        DateTime?
+  revokedAt        DateTime?
+  revocationReason String?
+
+  // Usage tracking
+  lastUsedAt DateTime?
+  useCount   Int       @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  holder        User?                    @relation(fields: [holderUserId], references: [id])
+  presentations PresentationCredential[]
+  schema        CredentialSchema?        @relation(fields: [schemaId], references: [id])
+
+  @@index([holderUserId])
+  @@index([holderDid])
+  @@index([issuerDid])
+  @@index([category])
+  @@index([status])
+}
+
+enum CredentialCategory {
+  BLOOD_WORK
+  PRESCRIPTIONS
+  VACCINATIONS
+  IMAGING
+  LAB_RESULTS
+  INSURANCE
+  GENERAL
+  IDENTITY
+  PROFESSIONAL
+}
+
+enum CredentialStatus {
+  PENDING // Offer received, not yet accepted
+  ACTIVE // Valid and usable
+  EXPIRED // Past expiration date
+  REVOKED // Revoked by issuer
+  SUSPENDED // Temporarily suspended
+}
+
+/// Credential schemas (for validation)
+model CredentialSchema {
+  id          String  @id @default(cuid())
+  name        String
+  version     String
+  description String?
+
+  // Schema definition
+  schema Json // JSON Schema
+
+  // Attributes
+  attributes Json // Array of attribute definitions
+
+  // Source
+  issuerDid String?
+  isPublic  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  credentials Credential[]
+
+  @@unique([name, version])
+  @@index([name])
+}
+
+// ============================================================================
+// VERIFIABLE PRESENTATIONS
+// ============================================================================
+
+/// Presentation requests and responses
+model Presentation {
+  id          String @id @default(cuid())
+  holderDid   String
+  verifierDid String
+
+  // Request details
+  requestId String @unique // OID4VP request ID
+  nonce     String
+
+  // Presentation type
+  presentationType PresentationType
+
+  // Request parameters
+  requestedCredentials Json // What was requested
+  selectedDisclosure   Json? // What attributes were disclosed
+
+  // Status
+  status PresentationStatus @default(REQUESTED)
+
+  // Timestamps
+  requestedAt DateTime  @default(now())
+  presentedAt DateTime?
+  verifiedAt  DateTime?
+  expiresAt   DateTime
+
+  // Verification result
+  verificationResult Json?
+
+  // Relations
+  credentials PresentationCredential[]
+  consent     Consent?
+
+  @@index([holderDid])
+  @@index([verifierDid])
+  @@index([status])
+}
+
+enum PresentationType {
+  FULL // Full credential disclosure
+  SELECTIVE // Selective attribute disclosure
+  ZKP // Zero-knowledge proof
+}
+
+enum PresentationStatus {
+  REQUESTED // Request created, awaiting holder response
+  PENDING // Holder notified, awaiting response
+  ACCEPTED // Holder accepted, presentation in progress
+  PRESENTED // Presentation submitted
+  VERIFIED // Successfully verified
+  REJECTED // Holder rejected
+  EXPIRED // Request expired
+  FAILED // Verification failed
+}
+
+/// Junction table for presentations containing multiple credentials
+model PresentationCredential {
+  id             String @id @default(cuid())
+  presentationId String
+  credentialId   String
+
+  // Which attributes were disclosed from this credential
+  disclosedAttributes String[]
+
+  presentation Presentation @relation(fields: [presentationId], references: [id], onDelete: Cascade)
+  credential   Credential   @relation(fields: [credentialId], references: [id])
+
+  @@unique([presentationId, credentialId])
+  @@index([presentationId])
+  @@index([credentialId])
+}
+
+// ============================================================================
+// CONSENT MANAGEMENT
+// ============================================================================
+
+/// Consent records for credential sharing
+model Consent {
+  id           String  @id @default(cuid())
+  holderUserId String?
+  holderDid    String
+  verifierDid  String
+  verifierName String
+
+  // What was consented
+  credentialTypes String[] // Types of credentials
+  credentialIds   String[] // Specific credential IDs
+  attributes      String[] // Specific attributes
+
+  // Consent scope
+  purpose       ConsentPurpose
+  purposeDetail String?
+
+  // Duration
+  grantedAt DateTime  @default(now())
+  expiresAt DateTime?
+
+  // Status
+  isActive      Boolean   @default(true)
+  revokedAt     DateTime?
+  revokedReason String?
+
+  // Access tracking
+  accessCount    Int       @default(0)
+  lastAccessedAt DateTime?
+
+  // Optional link to presentation
+  presentationId String? @unique
+
+  // Relations
+  holder       User?              @relation("HolderConsents", fields: [holderUserId], references: [id])
+  verifier     User?              @relation("VerifierConsents", fields: [verifierDid], references: [did])
+  presentation Presentation?      @relation(fields: [presentationId], references: [id])
+  accessLogs   ConsentAccessLog[]
+
+  @@index([holderDid])
+  @@index([verifierDid])
+  @@index([isActive])
+  @@index([purpose])
+}
+
+enum ConsentPurpose {
+  TREATMENT // Medical treatment @map("treatment")
+  INSURANCE_CLAIM // Insurance claims @map("insurance_claim")
+  RESEARCH // Medical research @map("research")
+  EMERGENCY // Emergency access @map("emergency")
+  REFERRAL // Healthcare referrals @map("referral")
+}
+
+/// Log of each access under a consent
+model ConsentAccessLog {
+  id        String @id @default(cuid())
+  consentId String
+
+  // Access details
+  accessedAt DateTime @default(now())
+  accessType String // "read" | "verify" | "present"
+  attributes String[] // Which attributes were accessed
+
+  // Context
+  ipAddress String?
+  userAgent String?
+
+  consent Consent @relation(fields: [consentId], references: [id], onDelete: Cascade)
+
+  @@index([consentId])
+  @@index([accessedAt])
+}
+
+// ============================================================================
+// CREDENTIAL ISSUANCE (OID4VCI)
+// ============================================================================
+
+/// Credential offers pending acceptance
+model CredentialOffer {
+  id          String  @id @default(cuid())
+  issuerDid   String
+  holderDid   String? // May be unknown initially
+  holderEmail String? // Email for pre-authorized offers
+
+  // Offer details
+  credentialType String
+  category       CredentialCategory
+
+  // OID4VCI parameters
+  preAuthorizedCode String? @unique
+  pinRequired       Boolean @default(false)
+  pin               String? // Hashed PIN
+
+  // Offer content
+  offerData Json // Credential data to be issued
+
+  // Status
+  status OfferStatus @default(PENDING)
+
+  // Timestamps
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  acceptedAt DateTime?
+
+  @@index([issuerDid])
+  @@index([holderDid])
+  @@index([holderEmail])
+  @@index([preAuthorizedCode])
+  @@index([status])
+}
+
+enum OfferStatus {
+  PENDING // Awaiting acceptance
+  ACCEPTED // Accepted, credential issued
+  REJECTED // Rejected by holder
+  EXPIRED // Offer expired
+  REVOKED // Revoked by issuer
+}
+
+// ============================================================================
+// EMERGENCY ACCESS
+// ============================================================================
+
+/// Emergency contacts for break-glass scenarios
+model EmergencyContact {
+  id     String @id @default(cuid())
+  userId String
+
+  // Contact info
+  contactUserId String? // If contact is a registered user
+  contactName   String
+  contactEmail  String?
+  contactPhone  String?
+  relationship  String // "spouse", "parent", "doctor", etc.
+
+  // Permissions
+  accessLevel        EmergencyAccessLevel @default(LIMITED)
+  allowedCredentials String[] // Empty = all, otherwise specific types
+
+  // Activation
+  activationMethod EmergencyActivationMethod @default(MANUAL)
+  inactivityDays   Int? // For time-based activation
+
+  // Status
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User  @relation("UserContacts", fields: [userId], references: [id], onDelete: Cascade)
+  contact User? @relation("EmergencyContactUser", fields: [contactUserId], references: [id])
+
+  @@index([userId])
+  @@index([contactUserId])
+}
+
+enum EmergencyAccessLevel {
+  FULL // Full access to all credentials
+  LIMITED // Only essential medical info
+  MINIMAL // Emergency contact info only
+}
+
+enum EmergencyActivationMethod {
+  MANUAL // User must manually activate
+  INACTIVITY // Activate after X days of inactivity
+  VERIFICATION // Requires third-party verification
+}
+
+/// Emergency access records (break-glass access tracking)
+model EmergencyAccessRecord {
+  id String @id @default(cuid())
+
+  // Patient
+  patientDid String
+
+  // Requester
+  requesterDid         String
+  requesterName        String
+  requesterRole        String // "physician", "nurse", "paramedic", etc.
+  requesterInstitution String
+
+  // Access details
+  reason              String // Emergency reason
+  credentialsAccessed String[] // List of credential IDs accessed
+  accessLevel         EmergencyAccessLevel @default(LIMITED)
+
+  // Status
+  status EmergencyAccessStatus @default(GRANTED)
+
+  // Timing
+  grantedAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  // Audit
+  ipAddress String?
+  userAgent String?
+
+  @@index([patientDid])
+  @@index([requesterDid])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+enum EmergencyAccessStatus {
+  REQUESTED // Initial request (not used in break-glass)
+  GRANTED // Access granted
+  EXPIRED // Access expired naturally
+  REVOKED // Access revoked before expiry
+}
+
+// ============================================================================
+// AUDIT LOGGING
+// ============================================================================
+
+/// Immutable audit log for all significant actions
+model AuditLog {
+  id String @id @default(cuid())
+
+  // Actor (who performed the action)
+  actorUserId String?
+  actorDid    String?
+
+  // Target (who/what was affected)
+  targetUserId String?
+  targetDid    String?
+  resourceType String? // "credential", "consent", "presentation"
+  resourceId   String?
+
+  // Event
+  eventType AuditEventType
+  action    String // Human-readable action description
+
+  // Details
+  details       Json? // Event-specific details
+  previousState Json? // State before change
+  newState      Json? // State after change
+
+  // Context
+  ipAddress String?
+  userAgent String?
+  sessionId String?
+
+  // Timestamps
+  timestamp DateTime @default(now())
+
+  // Relations
+  actor  User? @relation("ActorLogs", fields: [actorUserId], references: [id])
+  target User? @relation("TargetLogs", fields: [targetUserId], references: [id])
+
+  @@index([actorUserId])
+  @@index([targetUserId])
+  @@index([eventType])
+  @@index([resourceType, resourceId])
+  @@index([timestamp])
+}
+
+enum AuditEventType {
+  // Authentication
+  USER_REGISTERED
+  USER_LOGIN
+  USER_LOGOUT
+  USER_PASSWORD_CHANGED
+  USER_2FA_ENABLED
+  USER_2FA_DISABLED
+  PASSKEY_REGISTERED
+  PASSKEY_USED
+
+  // Wallet
+  WALLET_CREATED
+  WALLET_BACKED_UP
+  WALLET_RECOVERED
+
+  // DIDs
+  DID_CREATED
+  DID_UPDATED
+  DID_DEACTIVATED
+
+  // Credentials
+  CREDENTIAL_OFFERED
+  CREDENTIAL_ACCEPTED
+  CREDENTIAL_REJECTED
+  CREDENTIAL_ISSUED
+  CREDENTIAL_REVOKED
+  CREDENTIAL_DELETED
+
+  // Presentations
+  PRESENTATION_REQUESTED
+  PRESENTATION_SUBMITTED
+  PRESENTATION_VERIFIED
+  PRESENTATION_REJECTED
+
+  // Consent
+  CONSENT_GRANTED
+  CONSENT_REVOKED
+  CONSENT_EXPIRED
+  CONSENT_ACCESSED
+
+  // Emergency
+  EMERGENCY_CONTACT_ADDED
+  EMERGENCY_CONTACT_REMOVED
+  EMERGENCY_ACCESS_ACTIVATED
+  EMERGENCY_ACCESS_DEACTIVATED
+
+  // Security
+  SUSPICIOUS_ACTIVITY
+  RATE_LIMIT_EXCEEDED
+  UNAUTHORIZED_ACCESS_ATTEMPT
+}
+
+// ============================================================================
+// WEBHOOKS & NOTIFICATIONS
+// ============================================================================
+
+/// Webhook subscriptions for credential events
+model Webhook {
+  id     String @id @default(cuid())
+  userId String
+
+  // Webhook configuration
+  url    String
+  secret String // For HMAC signature
+
+  // Events to subscribe to
+  events String[] // Array of event types
+
+  // Status
+  isActive Boolean @default(true)
+
+  // Health tracking
+  consecutiveFailures Int       @default(0)
+  lastTriggeredAt     DateTime?
+  lastSuccessAt       DateTime?
+  lastFailureAt       DateTime?
+  lastError           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([userId])
+  @@index([isActive])
+}
+
+/// Webhook delivery attempts
+model WebhookDelivery {
+  id        String @id @default(cuid())
+  webhookId String
+
+  // Event data
+  eventType String
+  payload   Json
+
+  // Delivery status
+  status        DeliveryStatus @default(PENDING)
+  attempts      Int            @default(0)
+  lastAttemptAt DateTime?
+
+  // Response
+  responseStatus Int?
+  responseBody   String?
+
+  createdAt DateTime @default(now())
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+  RETRY
+}
+
+/// User notification preferences
+model NotificationPreference {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  // Email notifications
+  emailEnabled Boolean @default(true)
+  emailDigest  String  @default("immediate") // "immediate" | "daily" | "weekly"
+
+  // Push notifications
+  pushEnabled Boolean @default(true)
+  pushToken   String?
+
+  // Event preferences (JSON map of event type -> enabled)
+  eventPreferences Json @default("{}")
+
+  // Quiet hours
+  quietHoursEnabled Boolean @default(false)
+  quietHoursStart   String? // "22:00"
+  quietHoursEnd     String? // "08:00"
+  timezone          String  @default("UTC")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================================
+// INSTITUTIONS
+// ============================================================================
+
+/// Healthcare institutions (issuers/verifiers)
+model Institution {
+  id  String  @id @default(cuid())
+  did String? @unique
+
+  // Basic info
+  name        String
+  type        InstitutionType
+  description String?
+
+  // Contact
+  email   String?
+  phone   String?
+  website String?
+
+  // Address
+  address    String?
+  city       String?
+  state      String?
+  country    String?
+  postalCode String?
+
+  // Verification status
+  isVerified       Boolean   @default(false)
+  verifiedAt       DateTime?
+  verificationDocs Json?
+
+  // Branding
+  logoUrl      String?
+  primaryColor String?
+
+  // API access
+  apiKey     String? @unique
+  apiKeyHash String?
+  webhookUrl String?
+
+  // Status
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members InstitutionMember[]
+
+  @@index([did])
+  @@index([type])
+  @@index([apiKey])
+}
+
+enum InstitutionType {
+  HOSPITAL
+  CLINIC
+  PHARMACY
+  LABORATORY
+  INSURANCE
+  RESEARCH
+  GOVERNMENT
+  OTHER
+}
+
+/// Institution member (staff)
+model InstitutionMember {
+  id            String @id @default(cuid())
+  institutionId String
+
+  // Member info
+  email String
+  name  String
+  role  String // "admin" | "issuer" | "verifier" | "viewer"
+
+  // Permissions
+  canIssue         Boolean @default(false)
+  canVerify        Boolean @default(true)
+  canManageMembers Boolean @default(false)
+
+  // Status
+  isActive   Boolean   @default(true)
+  invitedAt  DateTime  @default(now())
+  acceptedAt DateTime?
+
+  institution Institution @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+
+  @@unique([institutionId, email])
+  @@index([institutionId])
+  @@index([email])
+}
+
+// ============================================================================
+// ANALYTICS (for UX research)
+// ============================================================================
+
+/// Track UI interactions for UX research
+model UXEvent {
+  id String @id @default(cuid())
+
+  // User (optional - for anonymous tracking)
+  userId    String?
+  sessionId String
+
+  // Event
+  eventName     String // "credential_folder_opened", "consent_revoked", etc.
+  eventCategory String // "navigation", "interaction", "conversion"
+
+  // Context
+  pagePath    String
+  componentId String?
+
+  // Event data
+  properties Json?
+
+  // Timing
+  durationMs Int? // How long the interaction took
+
+  // Device info
+  deviceType String? // "mobile" | "desktop" | "tablet"
+  browser    String?
+  os         String?
+
+  // A/B testing
+  experimentId String?
+  variant      String?
+
+  timestamp DateTime @default(now())
+
+  @@index([userId])
+  @@index([sessionId])
+  @@index([eventName])
+  @@index([timestamp])
+  @@index([experimentId])
+}

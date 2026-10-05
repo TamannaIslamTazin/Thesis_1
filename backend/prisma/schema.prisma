@@ -1,0 +1,2029 @@
+// SSI Healthcare - Prisma Schema
+// Comprehensive database schema for Self-Sovereign Identity management
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "./generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// CORE IDENTITY
+// ============================================================================
+
+/// User account - represents a credential holder (patient) or institutional user
+model User {
+  id            String    @id @default(cuid())
+  did           String?   @unique // DID created after wallet setup
+  /// Optional as of the auth/keystore round (2026-09-05): the wallet's
+  /// new-device flow (IDENTITY-AND-ISSUANCE-SPEC.md §4/§6) mints an account
+  /// from a DID and a passphrase-wrapped recovery envelope, with no mailbox at
+  /// all. Every row that predates this change already carries a non-null
+  /// unique email, so relaxing NOT NULL is a no-op for them — see the migration
+  /// header for the exact ALTER statement and why it touches no existing data.
+  /// `@unique` still holds: Postgres permits any number of NULLs in a unique
+  /// index, so it keeps deduplicating real addresses without constraining the
+  /// email-less rows against each other.
+  email         String?   @unique
+  emailVerified DateTime?
+  
+  // Profile
+  firstName     String?
+  lastName      String?
+  displayName   String?
+  avatarUrl     String?
+  phone         String?
+  
+  // Authentication
+  passwordHash  String?   // For email/password auth
+  totpSecret    String?   // For 2FA
+  totpEnabled   Boolean   @default(false)
+  
+  // Wallet status
+  walletSetup   Boolean   @default(false)
+  walletType    WalletType?
+  
+  // Security settings
+  biometricEnabled Boolean @default(false)
+  autoLockMinutes  Int     @default(5)
+  
+  // Timestamps
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  lastLoginAt   DateTime?
+  
+  // Relations
+  accounts          Account[]
+  sessions          Session[]
+  passkeys          Passkey[]
+  credentials       Credential[]
+  consentsGiven     Consent[]        @relation("HolderConsents")
+  auditLogs         AuditLog[]       @relation("ActorLogs")
+  targetLogs        AuditLog[]       @relation("TargetLogs")
+  emergencyContacts EmergencyContact[] @relation("UserContacts")
+  emergencyAccessTo EmergencyContact[] @relation("EmergencyContactUser")
+  webhooks          Webhook[]
+  notificationPrefs NotificationPreference?
+  hospitalConnections HospitalConnection[]
+  issuanceRequests    IssuanceRequest[]
+
+
+  @@index([email])
+  @@index([did])
+}
+
+enum WalletType {
+  CLOUD       // Custodial cloud wallet (easier onboarding)
+  DEVICE      // Device-bound keys
+  HARDWARE    // Hardware security module
+  HYBRID      // Cloud + device backup
+}
+
+// ============================================================================
+// DID CHALLENGE-RESPONSE LOGIN
+// ============================================================================
+
+/// A server-issued, single-use login nonce for POST /api/auth/did-login.
+///
+/// THE NONCE IS OURS, never the caller's — same rule as
+/// `services/professionalChallenge.ts` and `packages/locker/src/db.ts`:
+/// generated here, stored here, spent here. `consumeChallenge` in
+/// `services/didLoginAuth.ts` moves a row out of ISSUED with a single
+/// conditional `updateMany`, and only the caller that observes `count === 1`
+/// may proceed — the same compare-and-swap those two modules use, reimplemented
+/// against Postgres because this backend does not share a datastore with
+/// either of them (locker is deliberately dependency-minimal and self-hosted;
+/// see its package.json).
+model AuthChallenge {
+  id         String          @id @default(cuid())
+  nonce      String          @unique
+  did        String
+  /// This deployment's own DID, from `VERIFIER_DID` — the same "who are we"
+  /// value `requireProfessional` already binds presentations to. Reused rather
+  /// than introducing a second audience concept.
+  audience   String
+  state      ChallengeState  @default(ISSUED)
+  issuedAt   DateTime        @default(now())
+  expiresAt  DateTime
+
+  @@index([did])
+  @@index([state])
+}
+
+enum ChallengeState {
+  /// Issued, not yet spent. The only state `consumeChallenge` may move out of.
+  ISSUED
+  SPENT
+  EXPIRED
+}
+
+// ============================================================================
+// KEYSTORE VAULT — the passphrase-wrapped recovery envelope
+// ============================================================================
+
+/// The opaque, passphrase-sealed recovery-key envelope for the new-device
+/// login path (spec §6, §7a). Addressed ONLY by an HMAC of the phone handle —
+/// deliberately carries NO userId, NO did and NO plaintext phone number, so
+/// that a leak of this table alone cannot produce a list of enrolled numbers
+/// linked to identities (AUTH-AND-KEYSTORE-API.md §4). The join a caller would
+/// need — which handle belongs to which account — exists nowhere in this
+/// database.
+///
+/// `envelope` is stored and returned verbatim. This server derives no key from
+/// it and does not attempt to open it — see `services/keystoreVault.ts`.
+model KeystoreEnvelope {
+  id          String   @id @default(cuid())
+  /// HMAC-SHA256(KEYSTORE_HANDLE_PEPPER, normalised handle), hex. The only key
+  /// this row is ever looked up by.
+  handleHmac  String   @unique
+  /// HMAC-SHA256(KEYSTORE_OWNER_PEPPER, userId), hex. Authorises REPLACING an
+  /// existing slot by the same account that created it, without this table
+  /// holding — or being joinable to — a userId, a DID or a phone number.
+  /// Different pepper from `handleHmac` so leaking one derivation's pepper
+  /// does not help invert the other.
+  ownerTag    String
+  envelope    Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+/// OAuth accounts (Google, Apple, Microsoft)
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String  // "oauth" | "email" | "credentials"
+  provider          String  // "google" | "apple" | "microsoft" | "email"
+  providerAccountId String
+  
+  // OAuth tokens
+  accessToken       String?
+  refreshToken      String?
+  expiresAt         Int?
+  tokenType         String?
+  scope             String?
+  idToken           String?
+  
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+/// User sessions
+/// Session lifecycle state.
+///
+/// POST /api/auth/login creates a session row to hold the OTP challenge and
+/// returns its token to a caller who has NOT yet proven control of the mailbox.
+/// That row must never authenticate a request. `status` is the predicate that
+/// enforces it, and it is filtered inside findSessionByToken so no call site
+/// can forget to apply it.
+enum SessionStatus {
+  /// OTP issued, not yet verified. NOT a valid bearer token.
+  PENDING_VERIFICATION
+  /// Identity proven. Usable for authenticated requests.
+  ACTIVE
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  token        String   @unique
+
+  // Refresh token for automatic token renewal
+  refreshToken      String?  @unique
+  refreshExpiresAt  DateTime?
+
+  /// Defaults to ACTIVE so that existing rows and every non-OTP creation path
+  /// (OAuth, passkey, refresh) keep working. The magic-link login path sets
+  /// PENDING_VERIFICATION explicitly.
+  status       SessionStatus @default(ACTIVE)
+
+  // Session metadata
+  userAgent    String?
+  ipAddress    String?
+  deviceName   String?
+
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+  lastActiveAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+  @@index([refreshToken])
+  @@index([status])
+}
+
+/// WebAuthn passkeys for passwordless auth
+model Passkey {
+  id               String   @id @default(cuid())
+  userId           String
+  
+  // WebAuthn credential data
+  credentialId     String   @unique
+  publicKey        Bytes
+  counter          BigInt   @default(0)
+  transports       String[] // ["internal", "usb", "ble", "nfc"]
+  
+  // Metadata
+  deviceName       String?
+  lastUsedAt       DateTime?
+  
+  createdAt        DateTime @default(now())
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([credentialId])
+}
+
+// ============================================================================
+// DECENTRALIZED IDENTIFIERS
+// ============================================================================
+
+/// DID document storage
+model DIDDocument {
+  id              String    @id @default(cuid())
+  did             String    @unique
+  method          DIDMethod
+  
+  // DID Document content
+  document        Json      // Full DID Document
+  
+  // Key references (extracted for quick lookup)
+  verificationMethods Json? // Array of verification method IDs
+  
+  // Status
+  status          DIDStatus @default(ACTIVE)
+  deactivatedAt   DateTime?
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  @@index([did])
+  @@index([method])
+}
+
+enum DIDMethod {
+  KEY     // did:key
+  WEB     // did:web
+  CHEQD   // did:cheqd
+  ION     // did:ion
+  PEER    // did:peer
+}
+
+enum DIDStatus {
+  ACTIVE
+  DEACTIVATED
+  REVOKED
+}
+
+// ============================================================================
+// VERIFIABLE CREDENTIALS
+// ============================================================================
+
+/// Verifiable Credential storage
+model Credential {
+  id              String           @id @default(cuid())
+  holderUserId    String?
+  holderDid       String
+  issuerDid       String
+  
+  // Credential metadata
+  type            String[]         // ["VerifiableCredential", "HealthCredential"]
+  category        CredentialCategory
+  name            String
+  description     String?
+  
+  // Credential data.
+  //
+  // `credentialData` holds the W3C Verifiable Credential — the DATA MODEL only.
+  // On its own it proves nothing; it carries no signature for VC 2.0.
+  //
+  // `credentialJwt` holds the ENVELOPING PROOF: the compact JWT that secures
+  // the credential above. VC 2.0 separates the data model from the securing
+  // mechanism, so these are two columns rather than one — the signature is not
+  // a property of the credential and storing it inside `credentialData` would
+  // misrepresent an enveloped proof as an embedded one.
+  //
+  // Null for legacy VC 1.1 rows, which carry the same string at
+  // `credentialData.proof.jwt`, and for Data Integrity proofs, which have no
+  // envelope. Read it via `credentialEnvelopeJwt()` in services/jwtVc.ts rather
+  // than reaching for either location directly.
+  // `credentialFormat` says WHICH securing mechanism `credentialJwt` holds:
+  // `vc+jwt` (compact JWT) or `vc+sd-jwt` (compact SD-JWT, issuer JWT followed
+  // by tilde-separated disclosures). The two are not interchangeable — an
+  // SD-JWT splits into five `.`-segments, not three, so every naive JWT reader
+  // mis-parses it, and presenting one requires choosing a disclosure frame.
+  //
+  // EXPLICIT RATHER THAN SNIFFED. The structures are distinguishable, but a
+  // reader that sniffs mis-handles the first shape it did not anticipate and
+  // fails in the holder's wallet rather than here. The issuer knows at
+  // issuance; it is written down then.
+  //
+  // Null for pre-migration VC 1.1 rows, which have no envelope at all and keep
+  // their signature at `credentialData -> 'proof' ->> 'jwt'`. Null therefore
+  // means "legacy embedded proof", not "unknown".
+  credentialData  Json             // The VC JSON
+  credentialJwt   String?          // Compact JWT / SD-JWT envelope (VC 2.0 securing mechanism)
+  credentialFormat String?         // 'vc+jwt' | 'vc+sd-jwt'; null = legacy VC 1.1
+  credentialHash  String           @unique // SHA-256 hash for integrity
+  
+  // Schema reference
+  schemaId        String?
+  schemaVersion   String?
+  
+  // Status
+  status          CredentialStatus @default(ACTIVE)
+  issuedAt        DateTime
+  expiresAt       DateTime?
+  revokedAt       DateTime?
+  revocationReason String?
+  
+  // Usage tracking
+  lastUsedAt      DateTime?
+  useCount        Int              @default(0)
+  
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  
+  // Revocation — the credential's entry in its issuer's BitstringStatusList.
+  // `statusListIndex` is the bit position reserved for THIS credential in the
+  // on-ledger bitstring; it is allocated once at issuance and never reused,
+  // because reuse would silently transfer one credential's revocation to
+  // another. Both are null for credentials issued before status lists existed
+  // and for externally-issued credentials whose status we do not control.
+  statusListId    String?
+  statusListIndex Int?
+
+  // Relations
+  holder          User?            @relation(fields: [holderUserId], references: [id])
+  presentations   PresentationCredential[]
+  schema          CredentialSchema? @relation(fields: [schemaId], references: [id])
+  statusList      CredentialStatusList? @relation(fields: [statusListId], references: [id])
+
+  @@unique([statusListId, statusListIndex])
+  @@index([holderUserId])
+  @@index([holderDid])
+  @@index([issuerDid])
+  @@index([category])
+  @@index([status])
+}
+
+/// A W3C Bitstring Status List published as a cheqd DID-Linked Resource.
+///
+/// PARTITION: one list per (issuerDid, purpose). Not per credential type.
+/// A status list is a herd-privacy device: a verifier that dereferences the
+/// list learns only "someone asked about this issuer's revocation list", and
+/// the denser the list the less that tells them. Partitioning per credential
+/// type would shrink each list and leak the credential's type to whoever
+/// serves it; a list of one would be a direct identifier for the credential
+/// itself. The spec's 131,072-entry minimum exists for exactly this reason,
+/// and one list per issuer is the coarsest partition that still lets an
+/// issuer revoke only its own credentials.
+///
+/// THE LEDGER IS THE PUBLISHED COPY, NOT THE SOURCE OF TRUTH. The bitstring
+/// is never stored here — it is regenerated from
+/// `Credential.status = REVOKED` on every publish, so the on-ledger list
+/// cannot drift away from the database. This row only holds what cannot be
+/// derived: the resource's ledger coordinates and the index allocator.
+model CredentialStatusList {
+  id             String   @id @default(cuid())
+
+  /// The cheqd DID whose collection holds the resource. Also the VC issuer.
+  issuerDid      String
+  /// `revocation` or `suspension` — the BitstringStatusList statusPurpose.
+  purpose        String   @default("revocation")
+
+  /// DLR coordinates. Name + type are the STABLE key: cheqd versions a
+  /// resource by (collectionId, name, resourceType), and a
+  /// `?resourceName=&resourceType=` DID URL dereferences to the newest
+  /// version. That URL — not a pinned `/resources/<uuid>` one — is what
+  /// `statusListCredential` points at, so re-publishing updates every
+  /// credential already in the wild.
+  resourceName   String
+  resourceType   String   @default("BitstringStatusListRevocation")
+  /// Most recently written resource UUID and its version label. Kept for
+  /// audit and for resolving a specific historical version; not used for
+  /// normal status lookups.
+  latestResourceId String?
+  version        Int      @default(0)
+
+  /// Total bits in the list. 131072 is the spec minimum (16KB uncompressed).
+  length         Int      @default(131072)
+  /// Next free bit position. Monotonic: indices are never recycled.
+  nextIndex      Int      @default(0)
+
+  publishedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  credentials    Credential[]
+
+  @@unique([issuerDid, purpose])
+  @@index([issuerDid])
+}
+
+enum CredentialCategory {
+  BLOOD_WORK
+  PRESCRIPTIONS
+  VACCINATIONS
+  IMAGING
+  LAB_RESULTS
+  INSURANCE
+  GENERAL
+  IDENTITY
+  PROFESSIONAL
+}
+
+enum CredentialStatus {
+  PENDING     // Offer received, not yet accepted
+  ACTIVE      // Valid and usable
+  EXPIRED     // Past expiration date
+  REVOKED     // Revoked by issuer
+  SUSPENDED   // Temporarily suspended
+}
+
+/// Credential schemas (for validation)
+model CredentialSchema {
+  id            String   @id @default(cuid())
+  name          String
+  version       String
+  description   String?
+  
+  // Schema definition
+  schema        Json     // JSON Schema
+  
+  // Attributes
+  attributes    Json     // Array of attribute definitions
+  
+  // Source
+  issuerDid     String?
+  isPublic      Boolean  @default(true)
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  credentials   Credential[]
+  
+  @@unique([name, version])
+  @@index([name])
+}
+
+// ============================================================================
+// VERIFIABLE PRESENTATIONS
+// ============================================================================
+
+/// Presentation requests and responses
+model Presentation {
+  id              String              @id @default(cuid())
+  holderDid       String?
+  verifierDid     String
+  
+  // Request details
+  requestId       String              @unique // OID4VP request ID
+  nonce           String
+  
+  // Presentation type
+  presentationType PresentationType
+  
+  // Request parameters
+  requestedCredentials Json           // What was requested
+  selectedDisclosure   Json?          // What attributes were disclosed
+  
+  // Status
+  status          PresentationStatus  @default(REQUESTED)
+
+  /// The presented credentials and their DISCLOSED claims, captured at
+  /// verification FROM THE VERIFIED VP ITSELF.
+  ///
+  /// WHY NOT READ FROM THE credentials RELATION. That relation links to a
+  /// `Credential` row, and a credential the holder received directly from a
+  /// hospital issuer has NO such row — it lives on the device. Measured 24 Sep
+  /// 2026: a prescription verified, no PresentationCredential row was created,
+  /// and the verifier was handed an empty object while the holder had disclosed
+  /// a prescription. The VP carries the claims and its signature is what makes
+  /// them trustworthy, so they are recorded here rather than looked up.
+  presentedClaims Json?
+  
+  // Timestamps
+  requestedAt     DateTime            @default(now())
+  presentedAt     DateTime?
+  verifiedAt      DateTime?
+  expiresAt       DateTime
+  
+  // Verification result
+  verificationResult Json?
+  
+  // Relations
+  credentials     PresentationCredential[]
+  consent         Consent?
+  
+  @@index([holderDid])
+  @@index([verifierDid])
+  @@index([status])
+}
+
+enum PresentationType {
+  FULL            // Full credential disclosure
+  SELECTIVE       // Selective attribute disclosure
+  ZKP             // Zero-knowledge proof
+}
+
+enum PresentationStatus {
+  REQUESTED       // Request created, awaiting holder response
+  PENDING         // Holder notified, awaiting response
+  ACCEPTED        // Holder accepted, presentation in progress
+  PRESENTED       // Presentation submitted
+  VERIFIED        // Successfully verified
+  REJECTED        // Holder rejected
+  EXPIRED         // Request expired
+  FAILED          // Verification failed
+}
+
+/// Junction table for presentations containing multiple credentials
+model PresentationCredential {
+  id              String       @id @default(cuid())
+  presentationId  String
+  credentialId    String
+  
+  // Which attributes were disclosed from this credential
+  disclosedAttributes String[]
+  
+  presentation    Presentation @relation(fields: [presentationId], references: [id], onDelete: Cascade)
+  credential      Credential   @relation(fields: [credentialId], references: [id])
+  
+  @@unique([presentationId, credentialId])
+  @@index([presentationId])
+  @@index([credentialId])
+}
+
+// ============================================================================
+// CONSENT MANAGEMENT
+// ============================================================================
+
+/// Consent records for credential sharing
+model Consent {
+  id              String        @id @default(cuid())
+  holderUserId    String?
+  holderDid       String
+  verifierDid     String
+  verifierName    String
+  
+  // What was consented
+  credentialTypes String[]      // Types of credentials
+  credentialIds   String[]      // Specific credential IDs
+  attributes      String[]      // Specific attributes
+  
+  // Consent scope
+  purpose         ConsentPurpose
+  purposeDetail   String?
+  
+  // Duration
+  grantedAt       DateTime      @default(now())
+  expiresAt       DateTime?
+  
+  // Status
+  isActive        Boolean       @default(true)
+  revokedAt       DateTime?
+  revokedReason   String?
+  
+  // Access tracking
+  accessCount     Int           @default(0)
+  lastAccessedAt  DateTime?
+  
+  // Optional link to presentation
+  presentationId  String?       @unique
+
+  // THE HOLDER-SIGNED CONSENT RECEIPT (steno #279).
+  //
+  // The compact JWS the holder signed on their device at the moment of
+  // disclosure. This row is an INDEX over that receipt, not the record itself:
+  // the row is what the operator can query, the receipt is what the holder can
+  // prove. If the two ever disagree, the receipt is right — it is the only one
+  // of the pair that is signed.
+  //
+  // Nullable because pre-receipt rows may exist and because an emergency-access
+  // record is created without a holder present. A row with no receipt is
+  // exactly as trustworthy as this operator, and no more; `receiptVerifiedAt`
+  // is what distinguishes the two cases at a glance.
+  receiptJws        String?     @db.Text
+  /// Kantara `consentReceiptID` (the receipt's `jti`). Unique, so replaying one
+  /// receipt cannot create a second consent row.
+  receiptId         String?     @unique
+  receiptVerifiedAt DateTime?
+  /// Whether this record grants access that CONTINUES, or documents an act that
+  /// is already finished.
+  ///
+  /// A presentation is a completed disclosure: the verifier already holds the
+  /// claims and nothing will re-fetch anything, so `false` here means "Revoke"
+  /// would be theatre — it cannot un-send what was sent. Recording a one-time
+  /// disclosure as a 24-hour standing permission was how this screen came to
+  /// offer a control whose promise the system cannot keep.
+  standingAccess    Boolean   @default(false)
+  /// The verifier's OWN words. `purpose` is our five-value enum and is lossy by
+  /// construction; this is what they actually asked for.
+  purposeText       String?
+  
+  // Relations
+  // NO `verifier` RELATION, DELIBERATELY.
+  //
+  // `verifierDid` used to be a foreign key into `User.did`, which required every
+  // verifier to hold an account on THIS backend. That is the centralisation the
+  // whole design removes: a verifier is any party holding a DID and presenting a
+  // request, and a pharmacy has no reason to be our user. The constraint made
+  // every consent write for an external verifier fail with a foreign key
+  // violation, so no consent record had ever been written (observed 9 Sep 2026:
+  // presentation VERIFIED, Consent table empty).
+  //
+  // The holder-signed receipt is what makes the row trustworthy now — see
+  // `receiptJws`. Authenticity comes from the holder's signature, not from the
+  // verifier being someone we already know.
+  holder          User?         @relation("HolderConsents", fields: [holderUserId], references: [id])
+  presentation    Presentation? @relation(fields: [presentationId], references: [id])
+  accessLogs      ConsentAccessLog[]
+  
+  @@index([holderDid])
+  @@index([verifierDid])
+  @@index([isActive])
+  @@index([purpose])
+}
+
+enum ConsentPurpose {
+  TREATMENT       // Medical treatment @map("treatment")
+  INSURANCE_CLAIM // Insurance claims @map("insurance_claim")
+  RESEARCH        // Medical research @map("research")
+  EMERGENCY       // Emergency access @map("emergency")
+  REFERRAL        // Healthcare referrals @map("referral")
+}
+
+/// Log of each access under a consent
+model ConsentAccessLog {
+  id          String   @id @default(cuid())
+  consentId   String
+  
+  // Access details
+  accessedAt  DateTime @default(now())
+  accessType  String   // "read" | "verify" | "present"
+  attributes  String[] // Which attributes were accessed
+  
+  // Context
+  ipAddress   String?
+  userAgent   String?
+  
+  consent     Consent  @relation(fields: [consentId], references: [id], onDelete: Cascade)
+  
+  @@index([consentId])
+  @@index([accessedAt])
+}
+
+// ============================================================================
+// CREDENTIAL ISSUANCE (OID4VCI)
+// ============================================================================
+
+/// Credential offers pending acceptance
+model CredentialOffer {
+  id              String            @id @default(cuid())
+  issuerDid       String
+  holderDid       String?           // May be unknown initially
+  holderEmail     String?           // Email for pre-authorized offers
+  
+  // Offer details
+  credentialType  String
+  category        CredentialCategory
+  
+  // OID4VCI parameters
+  preAuthorizedCode String?         @unique
+  pinRequired     Boolean           @default(false)
+  pin             String?           // Hashed PIN
+  pinAttempts     Int               @default(0)
+  pinLockedUntil  DateTime?
+  
+  // Offer content
+  offerData       Json              // Credential data to be issued
+  
+  // Status
+  status          OfferStatus       @default(PENDING)
+  
+  // Timestamps
+  createdAt       DateTime          @default(now())
+  expiresAt       DateTime
+  acceptedAt      DateTime?
+  
+  @@index([issuerDid])
+  @@index([holderDid])
+  @@index([holderEmail])
+  @@index([preAuthorizedCode])
+  @@index([status])
+}
+
+enum OfferStatus {
+  PENDING         // Awaiting acceptance
+  ACCEPTED        // Accepted, credential issued
+  REJECTED        // Rejected by holder
+  EXPIRED         // Offer expired
+  REVOKED         // Revoked by issuer
+}
+
+// ============================================================================
+// EMERGENCY ACCESS
+// ============================================================================
+
+/// Emergency contacts for break-glass scenarios
+model EmergencyContact {
+  id              String   @id @default(cuid())
+  userId          String
+  
+  // Contact info
+  contactUserId   String?  // If contact is a registered user
+  contactName     String
+  contactEmail    String?
+  contactPhone    String?
+  relationship    String   // "spouse", "parent", "doctor", etc.
+  
+  // Permissions
+  accessLevel     EmergencyAccessLevel @default(LIMITED)
+  allowedCredentials String[] // Empty = all, otherwise specific types
+  
+  // Activation
+  activationMethod EmergencyActivationMethod @default(MANUAL)
+  inactivityDays  Int?     // For time-based activation
+  
+  // Status
+  isActive        Boolean  @default(true)
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  user            User     @relation("UserContacts", fields: [userId], references: [id], onDelete: Cascade)
+  contact         User?    @relation("EmergencyContactUser", fields: [contactUserId], references: [id])
+  
+  @@index([userId])
+  @@index([contactUserId])
+}
+
+enum EmergencyAccessLevel {
+  FULL            // Full access to all credentials
+  LIMITED         // Only essential medical info
+  MINIMAL         // Emergency contact info only
+}
+
+enum EmergencyActivationMethod {
+  MANUAL          // User must manually activate
+  INACTIVITY      // Activate after X days of inactivity
+  VERIFICATION    // Requires third-party verification
+}
+
+/// Emergency access records (break-glass access tracking)
+model EmergencyAccessRecord {
+  id                String   @id @default(cuid())
+  
+  // Patient
+  patientDid        String
+  
+  // Requester
+  requesterDid      String
+  requesterName     String
+  requesterRole     String   // "physician", "nurse", "paramedic", etc.
+  requesterInstitution String
+  
+  // Access details
+  reason            String   // Emergency reason
+  credentialsAccessed String[] // List of credential IDs accessed
+  accessLevel       EmergencyAccessLevel @default(LIMITED)
+  
+  // Status
+  status            EmergencyAccessStatus @default(GRANTED)
+  
+  // Timing
+  grantedAt         DateTime @default(now())
+  expiresAt         DateTime
+  revokedAt         DateTime?
+  
+  // Audit
+  ipAddress         String?
+  userAgent         String?
+  
+  @@index([patientDid])
+  @@index([requesterDid])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+enum EmergencyAccessStatus {
+  REQUESTED   // Initial request (not used in break-glass)
+  GRANTED     // Access granted
+  EXPIRED     // Access expired naturally
+  REVOKED     // Access revoked before expiry
+}
+
+// ============================================================================
+// AUDIT LOGGING
+// ============================================================================
+
+/// Immutable audit log for all significant actions
+model AuditLog {
+  id              String        @id @default(cuid())
+  
+  // Actor (who performed the action)
+  actorUserId     String?
+  actorDid        String?
+  
+  // Target (who/what was affected)
+  targetUserId    String?
+  targetDid       String?
+  resourceType    String?       // "credential", "consent", "presentation"
+  resourceId      String?
+  
+  // Event
+  eventType       AuditEventType
+  action          String        // Human-readable action description
+  
+  // Details
+  details         Json?         // Event-specific details
+  previousState   Json?         // State before change
+  newState        Json?         // State after change
+  
+  // Context
+  ipAddress       String?
+  userAgent       String?
+  sessionId       String?
+  
+  // Timestamps
+  timestamp       DateTime      @default(now())
+  
+  // Relations
+  actor           User?         @relation("ActorLogs", fields: [actorUserId], references: [id])
+  target          User?         @relation("TargetLogs", fields: [targetUserId], references: [id])
+  
+  @@index([actorUserId])
+  @@index([targetUserId])
+  @@index([eventType])
+  @@index([resourceType, resourceId])
+  @@index([timestamp])
+}
+
+enum AuditEventType {
+  // Authentication
+  USER_REGISTERED
+  USER_LOGIN
+  USER_LOGOUT
+  USER_PASSWORD_CHANGED
+  USER_2FA_ENABLED
+  USER_2FA_DISABLED
+  PASSKEY_REGISTERED
+  PASSKEY_USED
+  
+  // Wallet
+  WALLET_CREATED
+  WALLET_BACKED_UP
+  WALLET_RECOVERED
+  
+  // DIDs
+  DID_CREATED
+  DID_UPDATED
+  DID_DEACTIVATED
+  
+  // Credentials
+  CREDENTIAL_OFFERED
+  CREDENTIAL_ACCEPTED
+  CREDENTIAL_REJECTED
+  CREDENTIAL_ISSUED
+  CREDENTIAL_REVOKED
+  CREDENTIAL_DELETED
+  
+  // Presentations
+  PRESENTATION_REQUESTED
+  PRESENTATION_SUBMITTED
+  PRESENTATION_VERIFIED
+  PRESENTATION_REJECTED
+  
+  // Consent
+  CONSENT_GRANTED
+  CONSENT_REVOKED
+  CONSENT_EXPIRED
+  CONSENT_ACCESSED
+
+  // Claims
+  CLAIM_SUBMITTED
+  CLAIM_UPDATED
+  CLAIM_APPROVED
+  CLAIM_DENIED
+  
+  // Emergency
+  EMERGENCY_CONTACT_ADDED
+  EMERGENCY_CONTACT_REMOVED
+  EMERGENCY_ACCESS_ACTIVATED
+  EMERGENCY_ACCESS_DEACTIVATED
+  
+  // Pharmacy
+  PRESCRIPTION_VERIFIED
+  PRESCRIPTION_DISPENSED
+  
+  // ZKP
+  ZKP_REQUESTED
+  ZKP_GENERATED
+  ZKP_VERIFIED
+  ZKP_FAILED
+  
+  // Hospital
+  HOSPITAL_CONNECTED
+  HOSPITAL_SYNCED
+  HOSPITAL_DISCONNECTED
+  
+  // Security
+  SUSPICIOUS_ACTIVITY
+  RATE_LIMIT_EXCEEDED
+  UNAUTHORIZED_ACCESS_ATTEMPT
+
+  // L1 identity/licence issuance (IDENTITY-VERIFICATION-API.md)
+  ISSUANCE_REQUEST_SUBMITTED
+  ISSUANCE_REQUEST_WITHDRAWN
+  ISSUANCE_REQUEST_APPROVED
+  ISSUANCE_REQUEST_REJECTED
+  /// The single-use wrapped content key was handed to an officer. At most one
+  /// of these per request — see `IssuanceRequest.keyReleasedAt`.
+  ISSUANCE_KEY_RELEASED
+
+  // L1 authority roster (OFFICER-DOCUMENT-ACCESS.md §7)
+  /// An institution's first ADMIN was created via the one-time bootstrap path
+  /// (`routes/authorityMembers.ts`, `POST /api/authority/bootstrap`).
+  INSTITUTION_MEMBER_BOOTSTRAPPED
+  /// An ADMIN added a colleague to their institution's roster.
+  INSTITUTION_MEMBER_ADDED
+  /// An ADMIN changed a colleague's role or active status.
+  INSTITUTION_MEMBER_UPDATED
+}
+
+// ============================================================================
+// WEBHOOKS & NOTIFICATIONS
+// ============================================================================
+
+/// Webhook subscriptions for credential events
+model Webhook {
+  id              String   @id @default(cuid())
+  userId          String
+  
+  // Webhook configuration
+  url             String
+  secret          String   // For HMAC signature
+  
+  // Events to subscribe to
+  events          String[] // Array of event types
+  
+  // Status
+  isActive        Boolean  @default(true)
+  
+  // Health tracking
+  consecutiveFailures Int  @default(0)
+  lastTriggeredAt DateTime?
+  lastSuccessAt   DateTime?
+  lastFailureAt   DateTime?
+  lastError       String?
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries      WebhookDelivery[]
+  
+  @@index([userId])
+  @@index([isActive])
+}
+
+/// Webhook delivery attempts
+model WebhookDelivery {
+  id              String   @id @default(cuid())
+  webhookId       String
+  
+  // Event data
+  eventType       String
+  payload         Json
+  
+  // Delivery status
+  status          DeliveryStatus @default(PENDING)
+  attempts        Int            @default(0)
+  lastAttemptAt   DateTime?
+  
+  // Response
+  responseStatus  Int?
+  responseBody    String?
+  
+  createdAt       DateTime @default(now())
+  
+  webhook         Webhook  @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+  
+  @@index([webhookId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+  RETRY
+}
+
+/// User notification preferences
+model NotificationPreference {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  
+  // Email notifications
+  emailEnabled    Boolean  @default(true)
+  emailDigest     String   @default("immediate") // "immediate" | "daily" | "weekly"
+  
+  // Push notifications
+  pushEnabled     Boolean  @default(true)
+  pushToken       String?
+  
+  // Event preferences (JSON map of event type -> enabled)
+  eventPreferences Json    @default("{}")
+  
+  // Quiet hours
+  quietHoursEnabled Boolean @default(false)
+  quietHoursStart  String?  // "22:00"
+  quietHoursEnd    String?  // "08:00"
+  timezone         String   @default("UTC")
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================================
+// INSTITUTIONS
+// ============================================================================
+
+/// Healthcare institutions (issuers/verifiers)
+/// A one-time token an L1 officer shows as a QR so an L2 institution's software
+/// can pair with the issuer console and be onboarded.
+///
+/// WHY A TOKEN RATHER THAN THE OFFICER TYPING A URL INTO THE HOSPITAL MACHINE.
+/// The officer is standing in the building; the software is on a counter PC
+/// nobody wants to configure. Scanning is the whole onboarding interaction, and
+/// it must be safe to show on a shared screen.
+///
+/// THE TOKEN MINTS NOTHING BY ITSELF. Redeeming it pairs the software to the
+/// officer's console session; the officer then confirms what they verified on
+/// site, and only that confirmation mints. If a bitmap alone minted, the
+/// authorisation would come from the QR rather than from the officer's
+/// judgement, and the site visit — the one thing that makes an institution
+/// trustworthy — would be decorative.
+///
+/// SINGLE USE, ATOMICALLY CLAIMED. Spent by
+/// `updateMany({ where: { id, status: 'PENDING' } })`; `count !== 1` is the loss,
+/// the same shape as `consumeChallenge` and the console's single-use key release.
+/// A read-then-write would let two scans both succeed.
+model InstitutionEnrolment {
+  id            String   @id @default(cuid())
+  /// What the QR carries. Random and unguessable; never the row id.
+  token         String   @unique
+  /// The officer who created it, as an InstitutionMember.
+  ///
+  /// NOT a User. `InstitutionMember` is a ROSTER OF EMAILS with no relation to
+  /// `User` — they join only on the shared `email` column, which is why
+  /// `requireAuthorityMember` says email is the only column the two share. Two
+  /// seeded officers (`officer@bnmc`, `officer@pcb`) have NO `User` row at all,
+  /// so a foreign key to `User.id` could not even be satisfied for every officer.
+  /// Measured 24 Sep 2026: the original FK to `User.id` failed with
+  /// `Foreign key constraint violated: InstitutionEnrolment_officerMemberId_fkey`.
+  officerMemberId String
+  officer       InstitutionMember @relation("OfficerEnrolments", fields: [officerMemberId], references: [id])
+  /// The L1 authority the officer acts for. The minted DID's trust anchors here.
+  authorityId   String
+
+  /// Set by the scanning software, so the officer can SEE they are confirming
+  /// the right machine rather than an unknown one.
+  claimedBy           String?
+  claimedAt           DateTime?
+  /// The scanning software's OWN Ed25519 public key, multibase-encoded.
+  ///
+  /// SO THE INSTITUTION HOLDS ITS OWN KEY. The minted document always carries
+  /// one agent-held slot (#key-officer-1) because the SDK guard demands the
+  /// ledger-signing key be one this agent can sign with. A second slot from THIS
+  /// key is what makes the institution a 2-of-N that controls itself rather than
+  /// a 1-of-1 whose only key lives in the backend — which would be custody under
+  /// a different name (CLAUDE.md, custody principles).
+  ///
+  /// Optional only so an institution whose software cannot yet generate a key can
+  /// still be onboarded; when absent the document is 1-of-1, agent-held, and the
+  /// response says so rather than implying otherwise.
+  claimantPublicKey   String?
+  /// The institution, once created.
+  institutionId       String?  @unique
+
+  status        EnrolmentStatus @default(PENDING)
+  expiresAt     DateTime
+  createdAt     DateTime        @default(now())
+
+  @@index([officerMemberId])
+  @@index([status])
+}
+
+enum EnrolmentStatus {
+  PENDING
+  /// Scanned by the institution's software, awaiting the officer's confirmation.
+  CLAIMED
+  /// The institution was created and its DID minted.
+  COMPLETED
+  EXPIRED
+  /// Cancelled by the officer, or abandoned.
+  REVOKED
+}
+
+model Institution {
+  id              String           @id @default(cuid())
+  did             String?          @unique
+  
+  // Basic info
+  name            String
+  type            InstitutionType
+  description     String?
+  
+  // Contact
+  email           String?
+  phone           String?
+  website         String?
+  
+  // Address
+  address         String?
+  city            String?
+  state           String?
+  country         String?
+  postalCode      String?
+  
+  // Verification status
+  isVerified      Boolean          @default(false)
+  verifiedAt      DateTime?
+  verificationDocs Json?
+  
+  // Branding
+  logoUrl         String?
+  primaryColor    String?
+  
+  // API access
+  apiKey          String?          @unique
+  apiKeyHash      String?
+  webhookUrl      String?
+  
+  // Status
+  isActive        Boolean          @default(true)
+  
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  
+  members         InstitutionMember[]
+  issuanceRequests IssuanceRequest[]
+
+  @@index([did])
+  @@index([type])
+  @@index([apiKey])
+}
+
+enum InstitutionType {
+  HOSPITAL
+  CLINIC
+  PHARMACY
+  LABORATORY
+  INSURANCE
+  RESEARCH
+  GOVERNMENT
+  OTHER
+  /// L1: the ministry, for health-card issuance (IDENTITY-AND-ISSUANCE-SPEC.md §1).
+  MINISTRY
+  /// L1: a professional council — BMDC, BNMC, PCB — for licence issuance.
+  REGULATOR
+}
+
+/// Institution member (staff).
+///
+/// EMPLOYMENT ONLY — THIS MODEL DOES NOT ANSWER "MAY THEY". It records that a
+/// person is on an institution's roster, which is a fact the institution owns
+/// and can revoke by setting isActive.
+///
+/// It used to carry `role`, `canIssue`, `canVerify` and `canManageMembers`.
+/// Those four columns gated nothing: no route and no middleware ever read them
+/// (#253). They were removed in R4 rather than wired up, because the next
+/// reader would reasonably have taken them for the authorization answer and
+/// they are not — professional authority is a credential from an accrediting
+/// authority, verified at presentation time by `requireProfessional`. See
+/// `packages/shared/src/accreditation/`. Do not reintroduce a capability column
+/// here; a permission this server can grant itself is the centralised trust the
+/// system exists to remove.
+/// Which of an L1 authority's own staff a member is. Gates ONLY the L1
+/// issuer-dashboard endpoints added for identity/licence issuance
+/// (IDENTITY-VERIFICATION-API.md §5) — it says nothing about clinical
+/// authority, which remains a presented credential per the module header
+/// above. `OFFICER` covers queue review, approval and rejection (open to
+/// `ADMIN` too — see `requireAuthorityRole`'s header for why those routes are
+/// not additionally role-gated); `ADMIN` is required for roster management
+/// (`routes/authorityMembers.ts`, OFFICER-DOCUMENT-ACCESS.md §7): creating a
+/// colleague, changing a role, or deactivating a member.
+enum InstitutionMemberRole {
+  OFFICER
+  ADMIN
+}
+
+model InstitutionMember {
+  id              String   @id @default(cuid())
+  institutionId   String
+
+  // Member info
+  email           String
+  name            String
+  role            InstitutionMemberRole @default(OFFICER)
+
+  // Status
+  isActive        Boolean  @default(true)
+  invitedAt       DateTime @default(now())
+  acceptedAt      DateTime?
+
+  institution     Institution @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  /// Enrolment tokens this member created as an L1 officer. A site visit is
+  /// something a PERSON did, so the enrolment is attributed to their roster row.
+  officerEnrolments InstitutionEnrolment[] @relation("OfficerEnrolments")
+
+  @@unique([institutionId, email])
+  @@index([institutionId])
+  @@index([email])
+}
+
+// ============================================================================
+// ANALYTICS (for UX research)
+// ============================================================================
+
+/// Track UI interactions for UX research
+model UXEvent {
+  id              String   @id @default(cuid())
+  
+  // User (optional - for anonymous tracking)
+  userId          String?
+  sessionId       String
+  
+  // Event
+  eventName       String   // "credential_folder_opened", "consent_revoked", etc.
+  eventCategory   String   // "navigation", "interaction", "conversion"
+  
+  // Context
+  pagePath        String
+  componentId     String?
+  
+  // Event data
+  properties      Json?
+  
+  // Timing
+  durationMs      Int?     // How long the interaction took
+  
+  // Device info
+  deviceType      String?  // "mobile" | "desktop" | "tablet"
+  browser         String?
+  os              String?
+  
+  // A/B testing
+  experimentId    String?
+  variant         String?
+  
+  timestamp       DateTime @default(now())
+  
+  @@index([userId])
+  @@index([sessionId])
+  @@index([eventName])
+  @@index([timestamp])
+  @@index([experimentId])
+}
+
+// ============================================================================
+// INSURANCE CLAIMS
+// ============================================================================
+
+enum ClaimStatus {
+  PENDING
+  UNDER_REVIEW
+  APPROVED
+  DENIED
+  PAID
+}
+
+enum ClaimType {
+  MEDICAL
+  PRESCRIPTION
+  DENTAL
+  VISION
+  MENTAL_HEALTH
+  EMERGENCY
+}
+
+/// Insurance claims submitted by patients
+model InsuranceClaim {
+  id              String      @id @default(cuid())
+  claimNumber     String      @unique
+  holderDid       String
+
+  // Claim details
+  type            ClaimType
+  amount          Float
+  description     String
+  providerName    String
+  serviceDate     DateTime
+
+  // Status
+  status          ClaimStatus @default(PENDING)
+
+  // Linked credentials
+  credentialIds   String[]
+
+  // Status history stored as JSON array
+  statusHistory   Json        @default("[]")
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([holderDid])
+  @@index([status])
+  @@index([claimNumber])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// HOSPITAL CONNECTIONS
+// ============================================================================
+
+/// Links a patient's SSI identity to their record in a hospital system
+model HospitalConnection {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  hospitalId      String    // Identifier for the hospital (e.g. "city-general")
+  hospitalName    String    // Display name
+  hospitalUrl     String    // Base URL of the hospital API
+
+  patientId       String    // Patient's ID in the hospital system
+  patientName     String?   // Cached from hospital
+
+  isActive        Boolean   @default(true)
+  lastSyncAt      DateTime?
+  linkedAt        DateTime  @default(now())
+
+  @@unique([userId, hospitalId])
+  @@index([userId])
+}
+
+
+// ============================================================================
+// PASSKEY CHALLENGES (H-14: replace in-memory Map with durable DB storage)
+// ============================================================================
+
+model PasskeyChallenge {
+  id          String   @id @default(cuid())
+  challenge   String   @unique
+  userId      String
+  did         String?
+  type        String   // "registration" | "authentication"
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+
+// ============================================================================
+// R5 — INSTITUTIONAL CUSTODY: THE SIGNING AUDIT LOG AND THE CHAIN SILENT ALARM
+// ============================================================================
+//
+// Why these tables exist at all (steno #291, #293). Institutional custody is
+// 1-of-N verification methods, and S-4 measured that this makes each of the N
+// individually equivalent to the whole institution: one officer key alone can
+// evict every other officer (H1, height 86424) and can permanently deactivate
+// the institutional DID (G2+T1, code 1207). Neither is reversible. The owner
+// accepted 1-of-N on the explicit condition that DETECTION makes the race
+// winnable, so these tables are not reporting furniture — they are the control
+// that the custody model's safety argument rests on.
+//
+// TWO INDEPENDENT SOURCES, DELIBERATELY NOT MERGED. `SigningAuditEntry` is what
+// WE INTENDED; `ObservedDidTx` is WHAT ACTUALLY HAPPENED ON CHAIN. An attacker
+// holding an officer key never has to touch this backend — they broadcast
+// straight to the chain — so a chain event with no audit entry is the loudest
+// signal available. Reconciling the two into one table would destroy exactly
+// that signal.
+
+/// One immutable line of the signing log. See `services/custody/signingAuditLog.ts`.
+///
+/// APPEND-ONLY IS ENFORCED BY A DATABASE TRIGGER, not by convention: UPDATE and
+/// DELETE on this table raise. `seq`/`prevHash`/`entryHash` form a hash chain so
+/// that dropping the trigger and rewriting history is DETECTABLE. Read the
+/// header of `signingAuditLog.ts` for what the chain does and does not prove.
+model SigningAuditEntry {
+  /// Position in the hash chain. Assigned under an advisory lock, never reused.
+  seq              Int      @id
+  /// sha256 over the canonical serialisation of this entry, `prevHash` included.
+  entryHash        String   @unique
+  /// `entryHash` of seq-1. The genesis entry carries GENESIS_PREV_HASH.
+  prevHash         String
+
+  kind             SigningAuditKind
+  /// Ties an INTENT to the RESULT or REJECTION that followed it.
+  correlationId    String
+  /// The uuid we mint for `MsgCreate/UpdateDidDocPayload.versionId`. This is the
+  /// join key to the chain: it is our value and it appears in the on-chain
+  /// payload, so it survives a crash between broadcast and result.
+  versionId        String?
+
+  subjectDid       String
+  operation        String
+  /// WHICH VERIFICATION METHOD SIGNED. Under 1-of-N this is the whole of
+  /// attribution — there is no second signature to corroborate it.
+  signedByVerificationMethodId String?
+
+  /// WHAT WAS AUTHORISED, in full: the document being signed plus the delta.
+  /// Enough to reconstruct the authorisation, not merely to name the opcode.
+  payload          Json
+  /// sha256 of the canonical payload, so a truncated `payload` is detectable.
+  payloadDigest    String
+
+  actorSource      String
+  actorUserId      String?
+  sourceIp         String?
+  userAgent        String?
+  requestId        String?
+
+  txHash           String?
+  height           Int?
+  failureReason    String?
+
+  occurredAt       DateTime
+  recordedAt       DateTime @default(now())
+
+  @@index([subjectDid])
+  @@index([correlationId])
+  @@index([versionId])
+  @@index([kind])
+  @@index([recordedAt])
+}
+
+enum SigningAuditKind {
+  /// Written BEFORE broadcast. Carries the payload. Its existence is the claim
+  /// "this backend was about to authorise exactly this".
+  SIGNING_INTENT
+  /// Written after a committed, code-0 delivery. Carries txHash and height.
+  SIGNING_RESULT
+  /// Written when the broadcast was refused or failed. An intent with neither a
+  /// RESULT nor a REJECTION is itself a finding.
+  SIGNING_REJECTED
+}
+
+/// A did:cheqd whose `MsgUpdateDidDoc` / `MsgDeactivateDidDoc` traffic is watched.
+///
+/// `lastSeen*` is the watcher's running picture of the document, advanced strictly
+/// in block order. It is what makes "an officer was EVICTED" distinguishable from
+/// "an officer key was ROTATED" without a second chain query.
+model WatchedInstitutionalDid {
+  did                       String   @id
+  label                     String
+  /// Height at which watching began. Anything earlier was never observed and
+  /// must not be reported as if it had been.
+  watchedFromHeight         Int
+  lastSeenVerificationMethodIds String[]
+  lastSeenVerificationMethodDigest String
+  lastSeenControllers       String[]
+  lastSeenVersionId         String?
+  lastSeenHeight            Int?
+  deactivated               Boolean  @default(false)
+  registeredAt              DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+}
+
+/// The watcher's resume point. Exactly one row, `id = 'default'`.
+///
+/// `lastScannedHeight` advances ONLY in the same transaction that commits the
+/// findings for that height, so a crash re-scans rather than skips. A watcher
+/// that silently skips the blocks it was down for looks like it is working,
+/// which is worse than not having one.
+model ChainWatchCursor {
+  id                String   @id
+  lastScannedHeight Int
+  chainId           String
+  startedFromHeight Int
+  updatedAt         DateTime @updatedAt
+}
+
+/// One observed on-chain DID-module message. WHAT ACTUALLY HAPPENED.
+///
+/// Deduplicated by (txHash, msgIndex) so that re-scanning a height after a crash
+/// is idempotent.
+model ObservedDidTx {
+  id           String   @id @default(cuid())
+  txHash       String
+  msgIndex     Int
+  height       Int
+  blockTime    DateTime
+  typeUrl      String
+  subjectDid   String
+  versionId    String?
+  /// DeliverTx code read from the tx index, NOT from a sync broadcast. `null`
+  /// means the node could not tell us — treated as "it happened", never as "it
+  /// did not".
+  deliveryCode Int?
+  signerVerificationMethodIds String[]
+  /// The decoded message, verbatim enough to reconstruct the change.
+  decoded      Json
+  observedAt   DateTime @default(now())
+
+  @@unique([txHash, msgIndex])
+  @@index([subjectDid])
+  @@index([height])
+  @@index([versionId])
+}
+
+/// A raised alarm. Persisted so that an operator sees it after a restart and so
+/// that "nobody was watching the log at 03:00" is not a way to lose the signal.
+model CustodyAlarm {
+  id            String        @id @default(cuid())
+  raisedAt      DateTime      @default(now())
+  severity      AlarmSeverity
+  kind          AlarmKind
+  attribution   AlarmAttribution
+  subjectDid    String?
+  txHash        String?
+  height        Int?
+  signerVerificationMethodIds String[]
+  /// The one-paragraph statement an operator reads first: what happened, what it
+  /// cannot be undone by, and what to do in the next few minutes.
+  headline      String
+  detail        Json
+  /// Matching audit entry, when there is one. Absence is the alarm.
+  matchedAuditSeq Int?
+  acknowledgedAt  DateTime?
+  acknowledgedBy  String?
+
+  @@index([severity, raisedAt])
+  @@index([kind])
+  @@index([subjectDid])
+  @@index([acknowledgedAt])
+}
+
+enum AlarmSeverity {
+  CRITICAL
+  WARNING
+  INFO
+}
+
+enum AlarmKind {
+  /// Irreversible. `code 1207`, no on-chain remedy exists (S-4 T1).
+  DID_DEACTIVATED
+  /// A verification method was REMOVED. After enough of these the institution
+  /// holds no key and cannot rotate anything (S-4 H1, steno #291).
+  OFFICER_EVICTED
+  /// The controller set changed. Not repairable (S-1 §5.4).
+  CONTROLLER_CHANGED
+  /// Same slot, new key material. The routine, expected operation.
+  OFFICER_ROTATED
+  OFFICER_ADDED
+  /// An update that changed no verification method and no controller.
+  UPDATE_WITHOUT_KEY_CHANGE
+  /// A DID-module message against a watched DID that the chain REJECTED.
+  REJECTED_ATTEMPT
+  /// We hold a SIGNING_RESULT the chain never showed us.
+  BROADCAST_NOT_ON_CHAIN
+  /// An intent that produced neither a result nor a rejection.
+  INTENT_UNRESOLVED
+  /// Blocks the watcher was down for can no longer be read (node pruning).
+  WATCH_GAP_UNRECOVERABLE
+  /// The watcher has not advanced for longer than its stall threshold.
+  WATCHER_STALLED
+  /// The signing log's hash chain does not verify.
+  AUDIT_CHAIN_TAMPERED
+}
+
+enum AlarmAttribution {
+  /// A signing audit entry accounts for this chain event.
+  MATCHED
+  /// NO audit entry accounts for it. Someone acted without going through us —
+  /// the loudest signal this system can produce. Never downgrade it.
+  UNMATCHED
+  /// Not a chain event (watcher health, log integrity).
+  NOT_APPLICABLE
+}
+
+// ============================================================================
+// R5 — IDENTITY RE-ISSUANCE ("visa re-issuance")
+//
+// The problem these three models solve is the one the passport analogy names:
+// when a holder's DID is permanently unrecoverable, the holder needs a new
+// identifier AND every authority that issued a credential against the old one
+// has to issue it again against the new one. Nothing in this schema recorded
+// either half. `Credential.holderDid` says what a credential is bound to; it
+// says nothing about what SUPERSEDED what, so a re-issuance run could not be
+// resumed, could not be made idempotent, and left no trail an auditor could
+// follow from the old identity to the new one.
+//
+// WHY THE LINEAGE IS A TABLE AND NOT A COLUMN. A `supersededBy` column on
+// Credential would record the edge but not the ACT: who authorised it, on what
+// evidence, when it was authorised versus when it ran, and which of the
+// credentials bound to the dead DID were deliberately NOT carried forward. The
+// last of those is the one that matters in an audit — "this credential was not
+// re-issued because the issuer had already revoked it" is a finding, and a null
+// column cannot express it.
+// ============================================================================
+
+/// The authorisation to re-issue an identity, and the whole of its authentication.
+///
+/// THE HOLDER'S KEY CANNOT AUTHENTICATE THIS. The missing key is the entire
+/// problem, so authority has to come from the institutional half of the 2-of-2
+/// controller set (S-1 §8.3) — which is exactly the trust relationship that
+/// enrolment establishes, and exactly what the thesis is arguing about.
+///
+/// `institutionalSignature` is an Ed25519 signature by ONE of the institutional
+/// DID's N verification methods (any one suffices, S-4 M1) over
+/// `authorisationDigest`. Anyone who can resolve the institutional DID can check
+/// it without asking this backend anything, which is the property that makes it
+/// evidence rather than a log line.
+///
+/// WHAT IT ASSUMES, WRITTEN DOWN RATHER THAN IMPLIED: that the institution's
+/// out-of-band identity check was sound. A dishonest officer can migrate any
+/// legacy patient onto a DID they control and no cryptographic control can stop
+/// them, because the only key that could object is the one that is gone. So the
+/// design does not pretend to prevent it — it makes it single-use, expiring,
+/// attributable to a named officer and a named key, and hash-chained into
+/// SigningAuditEntry, so the act is small, visible and countable (#302).
+model ReissuanceAuthorisation {
+  id                String   @id @default(cuid())
+
+  /// The dead identity this authorises the replacement of. UNIQUE: a second
+  /// authorisation for the same DID is a fork of an identity, not a retry.
+  oldDid            String   @unique
+  /// The account the officer identified in person. The off-chain anchor.
+  userId            String
+
+  /// Which institution vouched, and WHICH KEY of it signed. Under 1-of-N the
+  /// signing verification method is the whole of attribution — there is no
+  /// second signature to corroborate it (steno #291).
+  institutionalDid  String
+  institutionalVerificationMethodId String
+
+  /// sha256 over the canonical BDHT-REISSUANCE-AUTHORISATION-v1 statement.
+  authorisationDigest String @unique
+  /// base64 Ed25519 signature over `authorisationDigest` by the method above.
+  institutionalSignature String
+  /// Single-use. The unique index is what makes replay unconstructable rather
+  /// than merely discouraged.
+  nonce             String   @unique
+
+  /// WHO did the in-person check, and against WHAT. The evidence itself is
+  /// never stored — a national ID number in this table would be a worse
+  /// liability than the problem it documents. Only a reference and a digest.
+  officerId         String
+  officerName       String
+  evidenceKind      ReissuanceEvidenceKind
+  evidenceReference String
+  evidenceDigest    String
+
+  /// Short-lived on purpose. An authorisation that cannot expire is a standing
+  /// permission to seize an identity.
+  notBefore         DateTime
+  notAfter          DateTime
+
+  createdAt         DateTime @default(now())
+  consumedAt        DateTime?
+
+  succession        DidSuccession?
+
+  @@index([userId])
+  @@index([institutionalDid])
+}
+
+enum ReissuanceEvidenceKind {
+  /// Bangladesh National ID card, checked in person.
+  NATIONAL_ID_IN_PERSON
+  BIRTH_CERTIFICATE_IN_PERSON
+  PASSPORT_IN_PERSON
+  /// The holder was identified by an already-enrolled guardian or next of kin.
+  VOUCHED_BY_ENROLLED_GUARDIAN
+  /// Reserved for a migration run by an operator against test data. Never
+  /// acceptable for a real patient; kept distinct so it is greppable.
+  OPERATOR_TEST_DATA
+}
+
+/// The old passport → new passport link. One row per migrated identity.
+///
+/// This is what makes an old DID discoverably DEAD without deactivating it.
+/// Deactivation is deliberately NOT the mechanism: `MsgDeactivateDidDoc` needs
+/// signatures from controllers ∪ ALL verification-method controllers (S-1 D1),
+/// which for the unrecoverable shape is the lost key itself — so in the general
+/// case the old DID CANNOT be deactivated, and a procedure that requires the key
+/// it has just declared lost is not a procedure. S-4 T1 adds that deactivation
+/// is terminal and is itself a transaction that can fail.
+model DidSuccession {
+  id            String @id @default(cuid())
+
+  /// UNIQUE both ways. One old DID has exactly one successor, and no DID is the
+  /// successor of two identities — either would be an identity fork, and a
+  /// unique index makes it unconstructable instead of merely unlikely.
+  oldDid        String @unique
+  newDid        String @unique
+  userId        String
+
+  reason        DidSuccessionReason
+  status        DidSuccessionStatus @default(PLANNED)
+  disposition   OldDidDisposition   @default(MARKED)
+
+  authorisationId String @unique
+  authorisation   ReissuanceAuthorisation @relation(fields: [authorisationId], references: [id])
+
+  /// Chain coordinates of the NEW identity, read back from the ledger rather
+  /// than taken from the broadcast result.
+  newDidTxHash  String?
+  newDidHeight  Int?
+  /// Set only when `disposition = DEACTIVATED`, which is available only while
+  /// the old key survives — i.e. never in the failure mode this exists for.
+  deactivationTxHash String?
+  deactivationHeight Int?
+
+  /// The worklist counters, so "was this migration complete?" is answerable
+  /// without recounting the child rows.
+  credentialsFound     Int @default(0)
+  credentialsReissued  Int @default(0)
+  credentialsSkipped   Int @default(0)
+  credentialsFailed    Int @default(0)
+
+  startedAt     DateTime @default(now())
+  completedAt   DateTime?
+  /// Populated when the run stopped without completing. An abandoned migration
+  /// must be legible as abandoned, not as finished.
+  abandonedAt   DateTime?
+  abandonReason String?
+
+  credentials   CredentialReissuance[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum DidSuccessionReason {
+  /// S-1 R0 / S-4 NC2: single self-controlled verification method. The device
+  /// key cannot be replaced because replacing it requires itself.
+  UNRECOVERABLE_SHAPE_LEGACY
+  /// Correct shape, but the recovery controller was lost too, so rotation is
+  /// unavailable and only re-issuance remains.
+  RECOVERY_CONTROLLER_LOST
+  /// The device key is believed to be in an attacker's hands and the identity
+  /// is being abandoned rather than rotated.
+  DEVICE_KEY_COMPROMISED
+}
+
+enum DidSuccessionStatus {
+  /// Authorised and recorded; the new DID does not exist yet.
+  PLANNED
+  /// The new DID is on chain and the credential worklist is being drained.
+  MIGRATING
+  /// Every credential reached a terminal outcome and the old DID is tombstoned.
+  COMPLETE
+  /// Stopped without completing. The old DID is still the live identity.
+  ABANDONED
+}
+
+enum OldDidDisposition {
+  /// Left resolvable on chain, marked dead HERE and by the revocation of every
+  /// credential bound to it. The only disposition available when the key is
+  /// genuinely lost, and therefore the only one the procedure depends on.
+  MARKED
+  /// Additionally deactivated on chain (`MsgDeactivateDidDoc`). Available ONLY
+  /// while the old key survives, and refused when the DID owns DID-linked
+  /// resources anything still needs to dereference.
+  DEACTIVATED
+}
+
+/// One row per credential that was bound to the dead DID — INCLUDING the ones
+/// deliberately not carried forward.
+///
+/// `oldCredentialId` is unique, and that single constraint is what makes the
+/// whole migration idempotent: a re-run cannot issue a second replacement for a
+/// credential that already has one, and a crash mid-run resumes instead of
+/// restarting. The row is written in PENDING BEFORE any signing happens, so the
+/// worklist is durable and a partial run is countable rather than invisible.
+model CredentialReissuance {
+  id              String @id @default(cuid())
+
+  successionId    String
+  succession      DidSuccession @relation(fields: [successionId], references: [id], onDelete: Cascade)
+
+  /// THE IDEMPOTENCY KEY.
+  oldCredentialId String @unique
+  newCredentialId String? @unique
+
+  outcome         ReissuanceOutcome @default(PENDING)
+  /// Why a non-REISSUED outcome was reached. Required reading in an audit: the
+  /// interesting rows are the ones that were NOT carried forward.
+  detail          String?
+
+  /// Copied from the old row so the decision is auditable even if the old row
+  /// is later purged.
+  oldCredentialHash String
+  oldStatus         String
+  oldFormat         String?
+
+  attemptedAt     DateTime @default(now())
+  settledAt       DateTime?
+
+  @@index([successionId])
+  @@index([outcome])
+}
+
+enum ReissuanceOutcome {
+  /// Written before signing. An entry still PENDING after a run is residue and
+  /// must stay countable.
+  PENDING
+  /// A replacement credential exists, bound to the new DID, and the old one has
+  /// been revoked.
+  REISSUED
+  /// The issuer had already revoked it. Carrying it forward would re-issue a
+  /// statement the issuer withdrew.
+  SKIPPED_REVOKED
+  /// Already past `expiresAt`. Re-issuing would silently extend a validity the
+  /// issuer never granted.
+  SKIPPED_EXPIRED
+  /// The issuer holds no revocation coordinates for it (`statusListIndex` is
+  /// null), so it can be neither revoked nor safely superseded. THE MEASURED
+  /// TRACKING GAP — see the module header in services/reissuance/.
+  UNTRACKABLE
+  /// Signing or persistence failed. The old credential is untouched.
+  FAILED
+}
+
+// ============================================================================
+// R5 PHASE C — GUARDIAN-SHARE BACKUP VAULT
+// ============================================================================
+
+/// Tracks the durability copy of the INSTITUTION guardian's SLIP-39 share in
+/// the backup vault (packages/backup-vault). A FAILED deposit must NOT fail
+/// enrolment — the guardian share physically exists with the guardian
+/// regardless of whether this copy landed — but "the ceremony completes and
+/// the copy silently doesn't exist" is a fail-open with a delay fuse that only
+/// surfaces during a recovery attempt. This row is the compensating control:
+/// the answer to "how many patients are missing their institutional share
+/// copy?" is `SELECT COUNT(*) WHERE status = 'PENDING'`, not an unknown
+/// (owner amendment 2, R5 Phase C).
+///
+/// One row per recovery-controller DID. Re-attempts UPDATE the same row
+/// (attempts, lastError, lastAttemptAt) rather than accumulating duplicates —
+/// the unique constraint on `recoveryControllerDid` is what makes the count
+/// meaningful.
+model InstitutionShareBackupJob {
+  id                     String                @id @default(cuid())
+  recoveryControllerDid  String                @unique
+  status                 BackupJobStatus       @default(PENDING)
+  attempts               Int                   @default(1)
+  lastError              String?
+  lastAttemptAt          DateTime              @default(now())
+  succeededAt            DateTime?
+  createdAt              DateTime              @default(now())
+
+  @@index([status])
+}
+
+enum BackupJobStatus {
+  /// Not yet confirmed deposited. Covers both "about to try" and "tried and
+  /// failed, awaiting retry" — both answer the same operational question.
+  PENDING
+  /// The vault confirmed the deposit (2xx from PUT .../shares/:index).
+  SUCCEEDED
+}
+
+// ============================================================================
+// R6 — L1 IDENTITY AND LICENCE ISSUANCE
+//
+// The gap this closes (IDENTITY-VERIFICATION-API.md): the wallet has shown a
+// "Verified" badge with no route behind it. A submission here is a holder
+// asking an L1 authority (ministry or a professional council) to review
+// documents held ENCRYPTED IN THE LOCKER — never here — and, on approval,
+// issue a credential through the existing CredentialOffer/OID4VCI path
+// (`services: issuance.ts` builds the claims; the offer itself is the same
+// row `POST /oid4vci/offers` creates).
+//
+// WHY `wrappedContentKey` IS ONE JSON COLUMN, NOT A SEPARATE TABLE OR ROW PER
+// DOCUMENT. IDENTITY-AND-ISSUANCE-SPEC.md §3.4 is explicit: "one submission,
+// one key" — every document in a submission is covered by a single officer
+// hand-off, not one per file. This server validates the envelope's SHAPE
+// (`services/issuance.ts`'s `wrappedContentKeyShape`) and never opens it —
+// the same boundary `KeystoreEnvelope.envelope` draws around the passphrase
+// envelope.
+// ============================================================================
+
+enum IssuanceRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  /// The holder withdrew it. Only reachable from PENDING.
+  WITHDRAWN
+}
+
+/// A holder's request that an L1 authority review documents and issue a
+/// credential. See the section header above for what this does and does not
+/// carry.
+model IssuanceRequest {
+  id                String   @id @default(cuid())
+
+  /// Optional so account deletion can `SET NULL` here exactly as it already
+  /// does for `Credential.holderUserId` (see that column's migration) rather
+  /// than being blocked by a decided submission's audit trail.
+  holderUserId      String?
+  /// Permanent snapshot. Unlike `holderUserId` this is never nulled — it is
+  /// the DID the authority actually reviewed and, on approval, issued to.
+  holderDid         String
+
+  /// Key into `DOCUMENT_TYPES` in `@ssi-healthcare/shared`. Not a foreign key:
+  /// the registry is a compiled-in literal, not a table (same reasoning as
+  /// `PROFESSIONAL_TRUST_ROOTS` — see accreditation/index.ts).
+  documentTypeId    String
+  /// Snapshot of `DOCUMENT_TYPES[...].credentialType` at submission time.
+  credentialType    String
+
+  authorityInstitutionId String
+  authority         Institution @relation(fields: [authorityInstitutionId], references: [id])
+  /// Snapshot of the authority's DID at submission time, so a later DID
+  /// rotation on the Institution row cannot retroactively change which key
+  /// this submission's content key was wrapped to.
+  authorityDid      String
+
+  status            IssuanceRequestStatus @default(PENDING)
+
+  /// The single-use wrapped content key for the WHOLE submission. Validated
+  /// shape only (`services/issuance.ts`); this column is never decrypted by
+  /// this server, and the value is NOT erased on release — release is
+  /// tracked by `keyReleasedAt`, below, because the single-use property is
+  /// about how many times the API hands it out, not about destroying it at
+  /// rest.
+  wrappedContentKey Json
+
+  /// The holder's locker read capability (OFFICER-DOCUMENT-ACCESS.md §3, §6a),
+  /// travelling on the same row as the wrapped key it grants access to —
+  /// round 5's fix for "nothing carries the capability" (steno #389). Stored
+  /// and returned OPAQUELY: this server validates its claims are internally
+  /// consistent with the submission (services/issuance.ts,
+  /// assertCapabilityMatchesSubmission) but cannot verify the SIGNATURE — the
+  /// capability's `aud` is the authority's DID, never this backend's, so a
+  /// signature check here would check the wrong audience. Unlike
+  /// `wrappedContentKey` this is NOT single-use (OFFICER-DOCUMENT-ACCESS.md
+  /// §4: the capability is time-bounded so an officer may re-open a document
+  /// during one review) and so is returned on every read, not gated by
+  /// `keyReleasedAt`.
+  lockerCapability  Json
+
+  /// Set by the FIRST `GET /api/authority/requests/:id`, and only the first —
+  /// see the route for the compare-and-swap that makes this true even under
+  /// concurrent requests or a crash mid-response.
+  keyReleasedAt         DateTime?
+  /// Plain reference, no FK — same pattern as `ReissuanceAuthorisation.officerId`.
+  /// A membership can be deactivated without losing the record of who read the key.
+  keyReleasedToMemberId String?
+
+  decidedAt         DateTime?
+  decidedByMemberId String?
+  rejectionReason   String?
+  /// Set on approval. The credential itself is issued later, when the holder
+  /// redeems this offer — this row does not duplicate that state.
+  issuedCredentialOfferId String?
+
+  withdrawnAt       DateTime?
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  holder            User?    @relation(fields: [holderUserId], references: [id])
+  documents         IssuanceRequestDocument[]
+
+  @@index([holderUserId])
+  @@index([holderDid])
+  @@index([authorityInstitutionId])
+  @@index([status])
+}
+
+/// One attached document: a reference into the locker, never the bytes
+/// themselves. `contentHash` is the sha256 hex the locker itself already
+/// checks against `X-Locker-Object-Hash` on write (packages/locker/src/server.ts)
+/// — carried here so a later officer can confirm they are looking at the
+/// object the holder actually declared, without this server ever fetching it.
+model IssuanceRequestDocument {
+  id                String @id @default(cuid())
+  issuanceRequestId String
+  lockerObjectId    String
+  contentHash       String
+  mediaType         String
+
+  createdAt         DateTime @default(now())
+
+  issuanceRequest   IssuanceRequest @relation(fields: [issuanceRequestId], references: [id], onDelete: Cascade)
+
+  @@index([issuanceRequestId])
+}
